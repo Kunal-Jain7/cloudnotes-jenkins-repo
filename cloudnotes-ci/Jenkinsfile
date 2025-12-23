@@ -1,0 +1,143 @@
+pipeline {
+  agent any
+
+  environment {
+    PROJECT_ID     = "gcp-cicd-demo-480118"
+    REGION         = "us-central1"
+    ARTIFACT_REPO  = "cloudnotes-docker"
+    BACKEND_IMAGE  = "backend"
+    FRONTEND_IMAGE = "frontend"
+    TAG            = "${BUILD_NUMBER}"
+  }
+
+  stages {
+
+    stage('Checkout Application Repo') {
+      steps {
+        git(
+          branch: 'main',
+          url: 'https://github.com/Kunal-Jain7/devops-end-to-end-gcp.git'
+        )
+      }
+    }
+
+    stage('Authenticate to GCP') {
+      steps {
+        withCredentials([file(credentialsId: 'gcp-sa-key', variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
+          sh '''
+            gcloud auth activate-service-account --key-file=$GOOGLE_APPLICATION_CREDENTIALS
+            gcloud config set project ${PROJECT_ID}
+            gcloud auth configure-docker ${REGION}-docker.pkg.dev --quiet
+          '''
+        }
+      }
+    }
+
+    stage('Build Backend Image') {
+      steps {
+        dir('cloudnotes-app/backend') {
+         sh '''
+            docker build -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}/${BACKEND_IMAGE}:${TAG} .
+            docker tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}/${BACKEND_IMAGE}:${TAG} \
+                       ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}/${BACKEND_IMAGE}:latest
+         '''
+        }
+      }
+    }
+
+    stage('Build Frontend Image') {
+      steps {
+        dir('cloudnotes-app/frontend') {
+         sh '''
+            docker build -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}/${FRONTEND_IMAGE}:${TAG} .
+            docker tag ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}/${FRONTEND_IMAGE}:${TAG} \
+                       ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}/${FRONTEND_IMAGE}:latest
+         '''
+        }
+      }
+    }
+
+    stage('Push Images') {
+      steps {
+        sh '''
+          docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}/${BACKEND_IMAGE}:${TAG}
+          docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}/${BACKEND_IMAGE}:latest
+          docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}/${FRONTEND_IMAGE}:${TAG}
+          docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}/${FRONTEND_IMAGE}:latest
+        '''
+      }
+    }
+
+    stage('Configure kubectl') {
+      steps {
+        sh '''
+          gcloud container clusters get-credentials cloudnotes-cluster \
+            --zone us-central1-a \
+            --project ${PROJECT_ID}
+        '''
+      }
+    }
+
+    stage('Detect Active Color') {
+      steps {
+        script {
+          def ACTIVE_COLOR = sh(
+            script: "kubectl get svc backend-service -n cloudnotes -o jsonpath='{.spec.selector.version}'",
+            returnStdout: true
+          ).trim()
+
+          def INACTIVE_COLOR = (ACTIVE_COLOR == "blue") ? "green" : "blue"
+
+          echo "Active color: ${ACTIVE_COLOR}"
+          echo "Inactive color: ${INACTIVE_COLOR}"
+
+          env.INACTIVE_COLOR = INACTIVE_COLOR
+        }
+      }
+    }
+
+    stage('Deploy to Inactive Color') {
+      steps {
+        sh '''
+          kubectl set image deployment/backend-$INACTIVE_COLOR \
+            backend=${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}/${BACKEND_IMAGE}:${TAG} \
+            -n cloudnotes
+
+          kubectl set image deployment/frontend-$INACTIVE_COLOR \
+            frontend=${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}/${FRONTEND_IMAGE}:${TAG} \
+            -n cloudnotes
+        '''
+      }
+    }
+
+    stage('Wait for Readiness') {
+      steps {
+        sh '''
+          kubectl rollout status deployment/backend-$INACTIVE_COLOR -n cloudnotes
+          kubectl rollout status deployment/frontend-$INACTIVE_COLOR -n cloudnotes
+        '''
+      }
+    }
+
+    stage('Switch Traffic') {
+      steps {
+        sh '''
+          kubectl patch service backend-service -n cloudnotes \
+            -p '{"spec":{"selector":{"app":"backend","version":"'"$INACTIVE_COLOR"'"}}}'
+
+          kubectl patch service frontend-service -n cloudnotes \
+            -p '{"spec":{"selector":{"app":"frontend","version":"'"$INACTIVE_COLOR"'"}}}'
+        '''
+      }
+    }
+  }
+
+  post {
+    failure {
+      echo "Deployment failed. Traffic NOT switched."
+    }
+    success {
+      echo "Blue-Green deployment completed successfully."
+    }
+  }
+}
